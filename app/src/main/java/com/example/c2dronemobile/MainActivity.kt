@@ -40,11 +40,12 @@ import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.Polyline
 import com.google.maps.android.compose.rememberCameraPositionState
 import com.google.maps.android.compose.rememberUpdatedMarkerState
+import com.google.maps.android.compose.CameraPositionState
+import com.google.android.gms.maps.CameraUpdateFactory
 import androidx.compose.ui.platform.LocalContext
-import android.content.Context
+import androidx.compose.runtime.LaunchedEffect
 
 private val DOYLE_PARK = LatLng(32.86447594950015, -117.2191930622458)
-private val DRONE_POSITION = DOYLE_PARK  // TODO: replace with live telemetry
 private const val DEFAULT_ZOOM = 18f
 
 private val DarkGray = Color(0xFF1A1A1A)
@@ -68,11 +69,14 @@ class MainActivity : ComponentActivity() {
 enum class AppMode { PLANNING, FLIGHT }
 
 data class DroneState(
-    val speed: Float = 0f,        // m/s groundspeed
-    val heading: Int = 0,         // degrees
-    val altitude: Float = 0f,     // meters AGL
-    val batteryPct: Int = 0,      // percentage
-    val connected: Boolean = false
+    val heading: Int = 0,
+    val altitude: Float = 0f,
+    val batteryPct: Int = 0,
+    val lat: Double = 0.0,
+    val lon: Double = 0.0,
+    val currentWaypoint: Int = 0,
+    val lastReachedWaypoint: Int = 0,
+    val flightMode: Int = 0
 )
 
 @Composable
@@ -82,75 +86,181 @@ fun MapScreen() {
     }
     val waypoints = remember { mutableStateListOf<LatLng>() }
     var mode by remember { mutableStateOf(AppMode.PLANNING) }
-    var isPaused by remember { mutableStateOf(false) }
 
     // MAVLink connection - USB serial only (for real hardware)
     val context = LocalContext.current
     val mavConnection = remember {
-        MavLinkConnection(UsbTransport(context))
+        MavLinkConnection(context).also { it.connect() }
     }
     val connectionState by mavConnection.connectionState.collectAsState()
     val droneState by mavConnection.droneState.collectAsState()
+    val missionState by mavConnection.missionState.collectAsState()
 
     val hasWaypoints = waypoints.isNotEmpty()
 
     Column(modifier = Modifier.fillMaxSize().background(DarkGray)) {
 
+        val dronePosition = if (droneState.lat != 0.0 && droneState.lon != 0.0) {
+            LatLng(droneState.lat, droneState.lon)
+        } else {
+            DOYLE_PARK
+        }
+
+        var mapLoaded by remember { mutableStateOf(false) }
+
+        LaunchedEffect(dronePosition, mapLoaded) {
+            if (mapLoaded) {
+                cameraPositionState.centerOnLocation(dronePosition)
+            }
+        }
+
         GoogleMap(
             modifier = Modifier.fillMaxWidth().weight(1f),
             cameraPositionState = cameraPositionState,
             properties = MapProperties(mapType = MapType.SATELLITE),
+            onMapLoaded = { mapLoaded = true },
             onMapLongClick = { latLng ->
                 if (mode == AppMode.PLANNING) waypoints.add(latLng)
             }
         ) {
+            // Scale drone size based on zoom (smaller when zoomed in)
+            val zoom = cameraPositionState.position.zoom
+            val droneSize = when {
+                zoom > 19f -> 5f
+                zoom > 17f -> 10f
+                zoom > 15f -> 15f
+                else -> 20f
+            }
             GroundOverlay(
-                position = GroundOverlayPosition.create(DOYLE_PARK, 20f, 20f),
+                position = GroundOverlayPosition.create(dronePosition, droneSize, droneSize),
                 image = BitmapDescriptorFactory.fromResource(R.drawable.drone_arrow),
-                bearing = 0f
+                bearing = droneState.heading.toFloat()
             )
 
+            // Show all waypoints - completed ones in grey, pending in default color
+            // Use lastReachedWaypoint to determine what's been completed
             waypoints.forEachIndexed { index, position ->
+                val wpSeq = index + 1  // waypoint 0 in list = seq 1 in mission
+                val isCompleted = droneState.lastReachedWaypoint >= wpSeq
                 Marker(
                     state = rememberUpdatedMarkerState(position = position),
-                    title = "Waypoint ${index + 1}"
+                    title = "Waypoint ${index + 1}",
+                    alpha = if (isCompleted) 0.4f else 1f
                 )
             }
 
             if (hasWaypoints) {
-                Polyline(
-                    points = listOf(DRONE_POSITION) + waypoints,
-                    color = Yellow,
-                    width = 5f
-                )
+                // Completed path - grey dotted line between completed waypoints
+                val completedWaypoints = waypoints.filterIndexed { index, _ ->
+                    droneState.lastReachedWaypoint >= index + 1
+                }
+                if (completedWaypoints.isNotEmpty()) {
+                    Polyline(
+                        points = completedWaypoints,
+                        color = Color.Gray,
+                        width = 4f,
+                        pattern = listOf(
+                            com.google.android.gms.maps.model.Dot(),
+                            com.google.android.gms.maps.model.Gap(10f)
+                        )
+                    )
+                }
+
+                // Remaining path - yellow solid line from drone to remaining waypoints
+                // Use lastReachedWaypoint to know where to start the yellow line
+                val nextWaypointIndex = droneState.lastReachedWaypoint  // index of next waypoint (0-based)
+                if (nextWaypointIndex < waypoints.size) {
+                    val remainingWaypoints = waypoints.drop(nextWaypointIndex)
+                    Polyline(
+                        points = listOf(dronePosition) + remainingWaypoints,
+                        color = Yellow,
+                        width = 5f
+                    )
+                } else if (droneState.lastReachedWaypoint == 0 && droneState.currentWaypoint == 0) {
+                    // Not in AUTO yet, show full path
+                    Polyline(
+                        points = listOf(dronePosition) + waypoints,
+                        color = Yellow,
+                        width = 5f
+                    )
+                }
             }
         }
 
         TelemetryBar(droneState, connectionState)
 
-        when (mode) {
-            AppMode.PLANNING -> MissionPlannerBar(
-                hasWaypoints = hasWaypoints,
-                onUndo = { waypoints.removeLast() },
-                onClear = { waypoints.clear() },
-                onUpload = {
-                    // TODO: Send mission to Pixhawk
+        // Auto-transition on mission upload complete/error
+        LaunchedEffect(missionState) {
+            when (missionState) {
+                is MissionState.Complete -> {
+                    kotlinx.coroutines.delay(1000)
                     mode = AppMode.FLIGHT
+                    mavConnection.resetMissionState()
                 }
+                is MissionState.Error -> {
+                    kotlinx.coroutines.delay(1500)
+                    mavConnection.resetMissionState()
+                }
+                else -> {}
+            }
+        }
+
+
+        // Check if mission is complete (all waypoints reached)
+        val missionComplete = hasWaypoints && droneState.lastReachedWaypoint >= waypoints.size
+
+        val landButton = ActionButton("Land", Color(0xFF64B5F6)) { mavConnection.sendSetMode(MODE_LAND) }
+
+        val uploadText = when (val state = missionState) {
+            is MissionState.Uploading -> "${state.current}/${state.total}"
+            is MissionState.Complete -> "Uploaded!"
+            is MissionState.Error -> "Failed"
+            else -> "Upload"
+        }
+        val uploadColor = when (missionState) {
+            is MissionState.Complete -> Color(0xFF90EE90)
+            is MissionState.Error -> RedPastel
+            else -> GreenPastel
+        }
+
+        when {
+            missionComplete -> ActionBar(
+                title = "✓ Mission Complete",
+                titleColor = GreenPastel,
+                buttons = listOf(
+                    landButton,
+                    ActionButton("New Mission", GreenPastel) {
+                        mavConnection.clearMission()
+                        mavConnection.resetWaypointTracking()
+                        waypoints.clear()
+                        mode = AppMode.PLANNING
+                    }
+                )
             )
-            AppMode.FLIGHT -> FlightControlBar(
-                isPaused = isPaused,
-                onPauseResume = {
-                    // TODO: Send LOITER/AUTO command to Pixhawk
-                    isPaused = !isPaused
-                },
-                onLand = { /* TODO: Send LAND command to Pixhawk */ },
-onLoiter = {
-                    // TODO: Send LOITER command to Pixhawk, clear mission
-                    waypoints.clear()
-                    mode = AppMode.PLANNING
-                    isPaused = false
-                }
+            mode == AppMode.PLANNING -> ActionBar(
+                title = "Mission Planner",
+                buttons = listOf(
+                    landButton,
+                    ActionButton("Undo", OrangePastel, hasWaypoints) { waypoints.removeLast() },
+                    ActionButton("Clear", RedPastel, hasWaypoints) { waypoints.clear() },
+                    ActionButton(uploadText, uploadColor, hasWaypoints) {
+                        mavConnection.uploadMission(waypoints.map { Waypoint(it.latitude, it.longitude, 4f) })
+                    }
+                )
+            )
+            mode == AppMode.FLIGHT -> ActionBar(
+                title = "Flight Control",
+                buttons = listOf(
+                    ActionButton("Pause", OrangePastel) { mavConnection.sendSetMode(MODE_LOITER) },
+                    ActionButton("Resume", GreenPastel) { mavConnection.sendSetMode(MODE_AUTO) },
+                    landButton,
+                    ActionButton("Abort", RedPastel) {
+                        mavConnection.sendSetMode(MODE_LOITER)
+                        mavConnection.clearMission()
+                        waypoints.clear()
+                        mode = AppMode.PLANNING
+                    }
+                )
             )
         }
     }
@@ -159,23 +269,16 @@ onLoiter = {
 data class ActionButton(
     val label: String,
     val color: Color,
-    val textColor: Color = Color.Black,
+    val enabled: Boolean = true,
     val onClick: () -> Unit
 )
 
 @Composable
-fun MissionPlannerBar(
-    hasWaypoints: Boolean,
-    onUndo: () -> Unit,
-    onClear: () -> Unit,
-    onUpload: () -> Unit
+fun ActionBar(
+    title: String,
+    titleColor: Color = Yellow,
+    buttons: List<ActionButton>
 ) {
-    val buttons = listOf(
-        ActionButton("Undo", OrangePastel) { onUndo() },
-        ActionButton("Clear All", RedPastel) { onClear() },
-        ActionButton("Upload", GreenPastel) { onUpload() }
-    )
-
     Column {
         Row(
             modifier = Modifier
@@ -183,12 +286,7 @@ fun MissionPlannerBar(
                 .background(MediumGray)
                 .padding(horizontal = 12.dp, vertical = 6.dp)
         ) {
-            Text(
-                text = "Mission Planner",
-                color = Yellow,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium
-            )
+            Text(title, color = titleColor, fontSize = 14.sp, fontWeight = FontWeight.Medium)
         }
 
         Row(
@@ -201,70 +299,21 @@ fun MissionPlannerBar(
             buttons.forEach { button ->
                 Button(
                     onClick = button.onClick,
-                    enabled = hasWaypoints,
-                    modifier = Modifier.weight(1f).height(70.dp),
+                    enabled = button.enabled,
+                    modifier = Modifier.weight(1f).height(48.dp),
                     shape = RoundedCornerShape(12.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(4.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = button.color,
-                        disabledContainerColor = DisabledGray,
-                        disabledContentColor = DisabledTextGray
+                        disabledContainerColor = DisabledGray
                     )
                 ) {
                     Text(
                         button.label,
-                        color = if (hasWaypoints) button.textColor else DisabledTextGray
+                        color = if (button.enabled) Color.Black else DisabledTextGray,
+                        fontSize = 12.sp,
+                        maxLines = 1
                     )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-fun FlightControlBar(
-    isPaused: Boolean,
-    onPauseResume: () -> Unit,
-    onLand: () -> Unit,
-    onLoiter: () -> Unit
-) {
-    val buttons = listOf(
-        ActionButton(if (isPaused) "Resume" else "Pause", OrangePastel) { onPauseResume() },
-        ActionButton("Land", GreenPastel) { onLand() },
-        ActionButton("Loiter", RedPastel) { onLoiter() }
-    )
-
-    Column {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(MediumGray)
-                .padding(horizontal = 12.dp, vertical = 6.dp)
-        ) {
-            Text(
-                text = "Flight Control",
-                color = Yellow,
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Medium
-            )
-        }
-
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(DarkGray)
-                .padding(horizontal = 12.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            buttons.forEach { button ->
-                Button(
-                    onClick = button.onClick,
-                    modifier = Modifier.weight(1f).height(48.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = button.color
-                    )
-                ) {
-                    Text(button.label, color = Color.Black)
                 }
             }
         }
@@ -281,7 +330,6 @@ fun TelemetryBar(state: DroneState, connectionState: ConnectionState) {
         horizontalArrangement = Arrangement.SpaceEvenly
     ) {
         ConnectionStatusItem(connectionState)
-        TelemetryItem("SPEED", "%.1f".format(state.speed), "m/s")
         TelemetryItem("HDG", "${state.heading}", "°")
         TelemetryItem("ALT", "%.1f".format(state.altitude), "m")
         TelemetryItem("BAT", "${state.batteryPct}", "%")
@@ -325,4 +373,11 @@ fun TelemetryItem(label: String, value: String, unit: String) {
             )
         }
     }
+}
+
+suspend fun CameraPositionState.centerOnLocation(location: LatLng) {
+    animate(
+        update = CameraUpdateFactory.newLatLng(location),
+        durationMs = 300
+    )
 }
