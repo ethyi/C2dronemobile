@@ -23,3 +23,9 @@ Android ground control app for ArduPilot drones. Connects via USB serial (SiK ra
 
 - Pixhawk flight controller running ArduCopter
 - SiK telemetry radio (57600 baud)
+
+
+# Demo
+https://github.com/user-attachments/assets/07a676e2-c9d7-42c3-9ab9-bf30229064ce
+
+<img src="https://github.com/user-attachments/assets/387735ae-0f74-4b5c-aab7-50a6d3327aa3" alt="drawing" width="200"/>
